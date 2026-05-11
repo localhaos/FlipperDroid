@@ -1,0 +1,341 @@
+name: FlipperDroid AIO Build (Standard + Shizuku)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flipperdroid-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Android APK Build (Standard + Shizuku)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      CI: true
+      TZ: UTC
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      GRADLE_OPTS: >
+        -Dorg.gradle.daemon=false
+        -Dorg.gradle.parallel=true
+        -Dorg.gradle.caching=true
+        -Dorg.gradle.configuration-cache=true
+        -Dorg.gradle.vfs.watch=false
+        -Dorg.gradle.console=plain
+        -Dfile.encoding=UTF-8
+        -Dkotlin.incremental=false
+        -Dorg.gradle.logging.level=info
+        -Dorg.gradle.warning.mode=all
+        -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=2g -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC"
+
+    steps:
+      - name: Harden Runner
+        run: |
+          set -euxo pipefail
+          echo "Runner hardening complete."
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/wrapper-validation-action@v3
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Install Android SDK Components
+        run: |
+          set -euxo pipefail
+          COMPONENTS=(
+            "platform-tools"
+            "platforms;android-35"
+            "build-tools;35.0.0"
+          )
+          for component in "${COMPONENTS[@]}"; do
+            for attempt in 1 2 3; do
+              sdkmanager "$component" && break || true
+              echo "Retry $attempt failed for $component"
+              sleep 15
+            done
+          done
+
+      - name: Verify Repository Structure
+        run: |
+          set -euxo pipefail
+          test -f gradlew
+          test -f settings.gradle || test -f settings.gradle.kts
+
+      # --- AUTOMATYCZNA INTEGRACJA SHIZUKU ---
+      - name: Add Shizuku Support (Manifest + Dependencies)
+        run: |
+          set -euxo pipefail
+          echo "🔧 Adding Shizuku support..."
+
+          # Install xmlstarlet (for XML editing)
+          if ! command -v xmlstarlet &>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq xmlstarlet
+          fi
+
+          # Find main AndroidManifest.xml
+          MANIFEST=$(find . -path "*/src/main/AndroidManifest.xml" -not -path "*/build/*" | head -n 1)
+          if [ -z "$MANIFEST" ]; then
+            echo "❌ AndroidManifest.xml not found!"
+            exit 1
+          fi
+          echo "Found manifest: $MANIFEST"
+
+          # 1. Add REQUEST_SHIZUKU_PERMISSION if missing
+          if ! grep -q 'android.permission.REQUEST_SHIZUKU_PERMISSION' "$MANIFEST"; then
+            echo "Adding REQUEST_SHIZUKU_PERMISSION..."
+            xmlstarlet ed -L \
+              -s "/manifest" -t elem -n "uses-permission" -v "" \
+              -i "/manifest/uses-permission[last()]" -t attr -n "android:name" -v "android.permission.REQUEST_SHIZUKU_PERMISSION" \
+              "$MANIFEST"
+          fi
+
+          # 2. Add ShizukuProvider to <application> if missing
+          if ! grep -q 'ShizukuProvider' "$MANIFEST"; then
+            echo "Adding ShizukuProvider..."
+            xmlstarlet ed -L \
+              -s "/manifest/application" -t elem -n "provider" -v "" \
+              -i "/manifest/application/provider[last()]" -t attr -n "android:name" -v "dev.rikka.shizuku.ShizukuProvider" \
+              -i "/manifest/application/provider[last()]" -t attr -n "android:authorities" -v "\${applicationId}.shizuku" \
+              -i "/manifest/application/provider[last()]" -t attr -n "android:enabled" -v "true" \
+              -i "/manifest/application/provider[last()]" -t attr -n "android:exported" -v "true" \
+              -i "/manifest/application/provider[last()]" -t attr -n "android:multiprocess" -v "false" \
+              -i "/manifest/application/provider[last()]" -t attr -n "android:permission" -v "android.permission.REQUEST_SHIZUKU_PERMISSION" \
+              "$MANIFEST"
+          fi
+
+          # 3. Add Shizuku dependency to app/build.gradle
+          BUILD_GRADLE=$(find . -path "*/app/build.gradle*" -not -path "*/build/*" | head -n 1)
+          if [ -n "$BUILD_GRADLE" ] && ! grep -q 'dev.rikka.shizuku:api' "$BUILD_GRADLE"; then
+            echo "Adding Shizuku API dependency to $BUILD_GRADLE..."
+            sed -i '0,/dependencies\s*{/s//&\n    implementation '\''dev.rikka.shizuku:api:13.1.5'\''/' "$BUILD_GRADLE"
+          fi
+
+          echo "✅ Shizuku integration complete."
+
+      - name: Grant Execute Permission
+        run: chmod +x ./gradlew
+
+      - name: Generate Build Metadata
+        run: |
+          set -euxo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BRANCH="${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}"
+          SAFE_BRANCH=$(echo "${BRANCH}" | tr '/' '-')
+          BUILD_DATE=$(date -u +"%Y%m%d-%H%M%S")
+          ENV_NAME="internal-${SAFE_BRANCH}-${SHORT_SHA}"
+          echo "ENV_NAME=${ENV_NAME}" >> $GITHUB_ENV
+          echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
+
+      - name: Print Runner Diagnostics
+        run: |
+          set -euxo pipefail
+          echo "=== System ==="
+          uname -a
+          echo "=== CPU/Memory ==="
+          nproc && free -h
+          echo "=== Java/Gradle ==="
+          java -version && ./gradlew --version
+
+      # --- WYKRYWANIE ZADAŃ GRADLE ---
+      - name: Discover Gradle Assemble Tasks
+        run: |
+          set -euxo pipefail
+          ./gradlew tasks --all --no-daemon > gradle_tasks.txt
+
+          # Standard task (priorytet dla internal/debug)
+          TASK=""
+          PRIORITY_TASKS=(
+            ":instances:android:app:assembleInternal"
+            ":instances:android:app:assembleDebug"
+            "assembleInternal"
+            "assembleDebug"
+          )
+          for candidate in "${PRIORITY_TASKS[@]}"; do
+            if grep -q "$candidate" gradle_tasks.txt; then
+              TASK="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$TASK" ]]; then
+            echo "❌ No suitable standard assemble task found!"
+            exit 1
+          fi
+          echo "Standard task: ${TASK}"
+          echo "TASK=${TASK}" >> $GITHUB_ENV
+
+          # Shizuku task (szukaj wariantów Shizuku)
+          SHIZUKU_TASK=""
+          SHIZUKU_CANDIDATES=(
+            ":instances:android:app:assembleShizukuDebug"
+            ":instances:android:app:assembleShizukuRelease"
+            "assembleShizukuDebug"
+            "assembleShizukuRelease"
+            "assembleShizukuVersionDebug"
+            "assembleShizukuVersionRelease"
+          )
+          for candidate in "${SHIZUKU_CANDIDATES[@]}"; do
+            if grep -q "$candidate" gradle_tasks.txt; then
+              SHIZUKU_TASK="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$SHIZUKU_TASK" ]]; then
+            echo "⚠️ Warning: No Shizuku assemble task found – Shizuku APK will not be built."
+          else
+            echo "Shizuku task: ${SHIZUKU_TASK}"
+            echo "SHIZUKU_TASK=${SHIZUKU_TASK}" >> $GITHUB_ENV
+          fi
+
+      - name: Warm Gradle Dependencies
+        run: |
+          set +e
+          ./gradlew dependencies --no-daemon --stacktrace || true
+
+      # --- BUDOWA STANDARD APK ---
+      - name: Build Standard APK
+        run: |
+          set -euxo pipefail
+          ./gradlew \
+            "${TASK}" \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --warning-mode all \
+            --build-cache \
+            -Dorg.gradle.project.env_name="${ENV_NAME}" \
+            -Dorg.gradle.project.build_date="${BUILD_DATE}" \
+            -Dorg.gradle.project.is_google_feature=true \
+            -Dorg.gradle.project.is_metric_enabled=true \
+            -Dorg.gradle.project.source_install=github \
+            -Dorg.gradle.project.current_flavor_type=PROD
+
+      # --- BUDOWA SHIZUKU APK (jeśli zadanie istnieje) ---
+      - name: Build Shizuku APK
+        if: env.SHIZUKU_TASK != ''
+        run: |
+          set -euxo pipefail
+          ./gradlew \
+            "${SHIZUKU_TASK}" \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --warning-mode all \
+            --build-cache \
+            -Dorg.gradle.project.env_name="${ENV_NAME}" \
+            -Dorg.gradle.project.build_date="${BUILD_DATE}" \
+            -Dorg.gradle.project.is_google_feature=true \
+            -Dorg.gradle.project.is_metric_enabled=true \
+            -Dorg.gradle.project.source_install=github
+
+      # --- GENEROWANIE ARTEFAKTÓW ---
+      - name: Generate Artifact Manifest
+        if: always()
+        run: |
+          set -euxo pipefail
+          {
+            echo "FlipperDroid AIO Build (Standard + Shizuku)"
+            echo "==========================================="
+            echo "ENV_NAME=${ENV_NAME}"
+            echo "BUILD_DATE=${BUILD_DATE}"
+            echo "COMMIT=${GITHUB_SHA}"
+            echo "BRANCH=${GITHUB_REF_NAME}"
+            echo
+            echo "Standard APK Task: ${TASK}"
+            echo "Shizuku APK Task: ${SHIZUKU_TASK:-Not built}"
+            echo
+            echo "Artifacts:"
+            echo "========="
+            find . \( -name "*.apk" -o -name "*.aab" \) | sort
+          } > artifact_manifest.txt
+          cat artifact_manifest.txt
+
+      - name: Generate SHA256 Checksums
+        if: always()
+        run: |
+          set -euxo pipefail
+          find . \( -name "*.apk" -o -name "*.aab" \) -exec sha256sum {} \; > checksums.txt || true
+          cat checksums.txt || true
+
+      # --- UPLOAD ARTEFAKTÓW (rozdzielone na Standard i Shizuku) ---
+      - name: Upload Standard APK Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlipperDroid-Standard-${{ env.ENV_NAME }}
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            **/build/outputs/apk/standard/**/*.apk
+            **/build/outputs/apk/debug/**/*.apk
+            **/build/outputs/apk/internal/**/*.apk
+            artifact_manifest.txt
+            checksums.txt
+
+      - name: Upload Shizuku APK Artifacts
+        if: always() && env.SHIZUKU_TASK != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlipperDroid-Shizuku-${{ env.ENV_NAME }}
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            **/build/outputs/apk/shizuku*/**/*.apk
+            **/build/outputs/apk/*Shizuku*/**/*.apk
+
+      # --- DIAGNOSTYKA (tylko w przypadku błędu) ---
+      - name: Upload Build Diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-diagnostics-${{ env.ENV_NAME }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            **/build/reports/**
+            **/build/test-results/**
+            **/build/outputs/logs/**
+            **/*.hprof
+            **/*.log
+            gradle_tasks.txt
+
+      # --- CZYSZCZENIE ---
+      - name: Cleanup Gradle State
+        if: always()
+        run: |
+          ./gradlew --stop || true
+          rm -rf ~/.gradle/daemon ~/.gradle/native || true
