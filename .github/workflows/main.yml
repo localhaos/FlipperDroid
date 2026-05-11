@@ -1,0 +1,51 @@
+name: Build APK (Internal)
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Auto environment name (based on branch + commit)
+      - name: Set dynamic environment name
+        run: |
+          echo "ENV_NAME=internal-$(echo ${GITHUB_REF_NAME} | tr '/' '-')-${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      # Load env file properly into GitHub Actions env
+      - name: Load env file
+        run: |
+          if [ -f .github/workflows/targets/gh_gms.env ]; then
+            cat .github/workflows/targets/gh_gms.env >> $GITHUB_ENV
+          fi
+
+      - name: Build APK
+        run: |
+          ./gradlew :instances:android:app:assembleInternal \
+            -Dorg.gradle.project.is_google_feature=true \
+            -Dorg.gradle.project.is_sentry_publish=true \
+            -Dorg.gradle.project.source_install=github \
+            -Dorg.gradle.project.is_metric_enabled=true \
+            -Dorg.gradle.project.current_flavor_type=PROD \
+            -Dorg.gradle.project.env_name=${ENV_NAME}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-internal-${{ env.ENV_NAME }}
+          path: instances/android/app/build/outputs/apk/internal/*.apk
