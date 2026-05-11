@@ -1,16 +1,15 @@
-name: Build FlipperDroid APK
+name: FlipperDroid AIO Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Wymuszamy Node 24 zgodnie z Twoim logiem
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -28,16 +27,27 @@ jobs:
           distribution: 'temurin'
           cache: 'gradle'
 
-      - name: Grant execute permission for gradlew
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant permissions
         run: chmod +x gradlew
 
-      - name: Build with Gradle
-        # Zmieniono z :instances:android:app na :app (standard w forkach)
-        # Jeśli build nadal sypie błędem, użyj samego 'assembleDebug'
-        run: ./gradlew :app:assembleDebug --stacktrace
+      - name: Generate Environment Name
+        run: |
+          # Tworzymy nazwę środowiska tak jak chciałeś, ale eksportujemy ją poprawnie
+          RAW_NAME="internal-$(echo ${GITHUB_REF_NAME} | tr '/' '-')-${GITHUB_SHA::7}"
+          echo "ENV_NAME=$RAW_NAME" >> $GITHUB_ENV
 
-      - name: Upload APK
+      - name: Build APK (Auto-Detect Module)
+        # Próbujemy zbudować :app:assembleInternal, a jeśli nie istnieje, samo assembleInternal
+        run: |
+          ./gradlew :app:assembleInternal -Dorg.gradle.project.env_name=${{ env.ENV_NAME }} --stacktrace || \
+          ./gradlew assembleInternal -Dorg.gradle.project.env_name=${{ env.ENV_NAME }} --stacktrace || \
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Find and Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FlipperDroid-Debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: FlipperDroid-Packages
+          path: "**/build/outputs/apk/**/*.apk"
